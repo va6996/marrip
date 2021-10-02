@@ -1,0 +1,142 @@
+#include "cache.h"
+
+#define maxRRPV 3
+#define NUM_POLICY 2
+#define MA_HISTORY 50
+#define MA_WINDOW 10
+#define MARRIP_THRS 15
+#define HIT_COUNT_THRS 50
+#define MARRIP_THRS_VAL (MARRIP_THRS*MA_HISTORY*MA_WINDOW)/100
+
+uint8_t rrpv[LLC_SET][LLC_WAY],
+         bip_counter = 0,
+         rotator = 0, 
+         last_computed_hit_count = 0, 
+         bip_max, 
+         miss_count[NUM_CPUS][MA_HISTORY],
+         hit_count[NUM_CPUS][MA_HISTORY],
+         counter[NUM_CPUS],
+         pointer[NUM_CPUS];
+
+uint8_t get_hit_rate(uint8_t cpu) {
+    uint8_t hits = 0, miss = 0, total = 0;
+    for (int i=0; i<MA_HISTORY;i++) {
+        hits += hit_count[cpu][i];
+        miss += miss_count[cpu][i];
+    }
+    last_computed_hit_count = hits;
+    total = hits + miss;
+
+    return hits*100/total;
+}
+
+void CACHE::llc_initialize_replacement() {
+    bip_max = (MARRIP_THRS*MA_HISTORY*MA_WINDOW)/100;
+
+    // set initial values to maxRRPV
+    for(int i=0; i<LLC_SET; i++) {
+        for(int j=0; j<LLC_WAY; j++)
+            rrpv[i][j] = maxRRPV;
+    }
+
+    // set initial hit and miss count to 0 for all CPUs
+    for (int i=0; i<NUM_CPUS; i++) {
+        for (int j=0;j<MA_HISTORY;j++) {
+            hit_count[i][j] = 0;
+            miss_count[i][j] = 0;
+        }
+
+        pointer[i] = 0;
+        counter[i] = 0;
+    }
+}
+
+// called on every cache hit and cache fill
+void CACHE::llc_update_replacement_state(uint8_t cpu, uint8_t set, uint8_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint8_t type, uint8_t hit) {
+    // update hit/miss counts
+    uint8_t head = pointer[cpu];
+    if (hit) {
+        hit_count[cpu][head]++;
+    } else {
+        miss_count[cpu][head]++;
+    }
+
+    // move to next window if current is full and set it to 0.
+    counter[head]++;
+    if (counter[head] == MA_WINDOW) {
+        counter[head] = 0;
+        uint8_t new_head = (head + 1) % MA_HISTORY;
+        pointer[cpu] = new_head;
+        hit_count[cpu][new_head] = 0;
+        miss_count[cpu][new_head] = 0;
+    }
+    
+	if (hit) { 
+		rrpv[set][way] = 0; // for cache hit, SRRIP always promotes a cache line to the MRU position
+		return;
+	}
+    
+    // get hit rate for mode selection
+    int hit_rate = get_hit_rate(cpu);
+
+    // BRRIP
+    if (hit_rate < MARRIP_THRS) {
+        rrpv[set][way] = maxRRPV;
+        // Always set to long reference prediction for writebacks
+        if (type == WRITEBACK) {
+            rrpv[set][way] = maxRRPV-1;
+        }
+
+        // if very low cache hits, randomly set to long reference prediction
+        uint8_t addition_counter = MARRIP_THRS_VAL/(last_computed_hit_count == 0 ? 1 : last_computed_hit_count);
+        if (addition_counter > 16)  addition_counter = 16;
+        bip_counter += addition_counter;
+        
+        if (bip_counter >= bip_max) bip_counter = 0;
+        if (bip_counter == 0) {
+            rrpv[set][way] = maxRRPV-1;
+        }
+    } else {
+        // SRRIP
+        rrpv[set][way] = maxRRPV-1;
+    }
+}
+
+// find replacement victim
+uint8_t CACHE::llc_find_victim(uint8_t cpu, uint64_t instr_id, uint8_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint8_t type) {
+    // If very low recent cache hits, then randomly select block with maxRRPV.
+    if (last_computed_hit_count < HIT_COUNT_THRS) {
+        uint8_t last_rotator = rotator;
+
+        // while(1) for edge case
+        while (1) {
+            while (++rotator != last_rotator) {
+                if (rotator == LLC_WAY) rotator = 0;
+                if (rrpv[set][rotator] == maxRRPV)
+                    return rotator;
+            }
+
+            for (int i=0; i<LLC_WAY; i++)
+                rrpv[set][i]++;
+        }
+    }
+
+    // look for the maxRRPV line
+    while (1) {
+        for (int i=0; i<LLC_WAY; i++)
+            if (rrpv[set][i] == maxRRPV)
+                return i;
+
+        for (int i=0; i<LLC_WAY; i++)
+            rrpv[set][i]++;
+    }
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::llc_replacement_final_stats() {
+
+}
